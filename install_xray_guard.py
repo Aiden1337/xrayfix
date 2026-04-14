@@ -1,230 +1,249 @@
 #!/usr/bin/env python3
-import argparse
-import os
-import shutil
-import stat
-import subprocess
-import sys
-import textwrap
-import urllib.request
-from datetime import datetime
+# -*- coding: utf-8 -*-
 
-DEFAULT_SCRIPT_URL = "https://raw.githubusercontent.com/Aiden1337/xrayfix/refs/heads/main/xray-guard.sh"
-DEFAULT_SCRIPT_PATH = "/usr/local/sbin/xray-guard.sh"
-DEFAULT_ENV_PATH = "/etc/default/xray-guard"
-DEFAULT_SERVICE_PATH = "/etc/systemd/system/xray-guard.service"
+import os
+import sys
+import shlex
+import socket
+import shutil
+import subprocess
+import tempfile
+import urllib.request
+import urllib.error
+from pathlib import Path
+
 SERVICE_NAME = "xray-guard.service"
+SHELL_URLS = [
+    "https://raw.githubusercontent.com/Aiden1337/xrayfix/refs/heads/main/xray-guard.sh",
+    "https://raw.githubusercontent.com/Aiden1337/xrayfix/main/xray-guard.sh",
+    "https://cdn.jsdelivr.net/gh/Aiden1337/xrayfix@main/xray-guard.sh",
+]
+
+SHELL_PATH = Path("/usr/local/sbin/xray-guard.sh")
+ENV_PATH = Path("/etc/default/xray-guard")
+SERVICE_PATH = Path("/etc/systemd/system/xray-guard.service")
+
 
 PRESETS = {
     "very-light": {
-        "PORT": "443",
-        "INTERVAL": "5",
-        "CPU_THRESHOLD": "450",
-        "GLOBAL_SYN_THRESHOLD": "900",
-        "GLOBAL_EST_THRESHOLD": "12000",
-        "PER_IP_SYN_BAN_THRESHOLD": "80",
-        "PER_IP_EST_BAN_THRESHOLD": "120",
-        "NFT_CONN_LIMIT": "120",
-        "NFT_RATE": "30/second",
-        "NFT_BURST": "80",
-        "BAN_TIMEOUT": "1h",
-        "TOP_LIMIT": "15",
-        "LOG_FILE": "/var/log/xray-guard.log",
-        "PROC_REGEX": "xray|rw-core|sing-box|v2ray",
+        "description": "максимально бережный режим, чтобы почти не резать легит трафик.",
+        "values": {
+            "PORT": "443",
+            "CHECK_INTERVAL": "5",
+            "CPU_THRESHOLD": "500",
+            "GLOBAL_SYN": "1200",
+            "GLOBAL_EST": "60000",
+            "PER_IP_SYN": "40",
+            "PER_IP_EST": "80",
+            "NFT_CONN_LIMIT": "60",
+            "NFT_RATE": "30/second",
+            "NFT_BURST": "60",
+            "BAN_TIMEOUT": "30m",
+        },
     },
     "optimal": {
-        "PORT": "443",
-        "INTERVAL": "5",
-        "CPU_THRESHOLD": "350",
-        "GLOBAL_SYN_THRESHOLD": "500",
-        "GLOBAL_EST_THRESHOLD": "7000",
-        "PER_IP_SYN_BAN_THRESHOLD": "40",
-        "PER_IP_EST_BAN_THRESHOLD": "60",
-        "NFT_CONN_LIMIT": "80",
-        "NFT_RATE": "20/second",
-        "NFT_BURST": "40",
-        "BAN_TIMEOUT": "2h",
-        "TOP_LIMIT": "15",
-        "LOG_FILE": "/var/log/xray-guard.log",
-        "PROC_REGEX": "xray|rw-core|sing-box|v2ray",
+        "description": "сбалансированный режим: уже фильтрует мусор, но аккуратнее с легит трафиком.",
+        "values": {
+            "PORT": "443",
+            "CHECK_INTERVAL": "5",
+            "CPU_THRESHOLD": "320",
+            "GLOBAL_SYN": "700",
+            "GLOBAL_EST": "28000",
+            "PER_IP_SYN": "25",
+            "PER_IP_EST": "45",
+            "NFT_CONN_LIMIT": "35",
+            "NFT_RATE": "18/second",
+            "NFT_BURST": "30",
+            "BAN_TIMEOUT": "2h",
+        },
     },
     "strong": {
-        "PORT": "443",
-        "INTERVAL": "5",
-        "CPU_THRESHOLD": "250",
-        "GLOBAL_SYN_THRESHOLD": "220",
-        "GLOBAL_EST_THRESHOLD": "3500",
-        "PER_IP_SYN_BAN_THRESHOLD": "20",
-        "PER_IP_EST_BAN_THRESHOLD": "30",
-        "NFT_CONN_LIMIT": "35",
-        "NFT_RATE": "10/second",
-        "NFT_BURST": "16",
-        "BAN_TIMEOUT": "3h",
-        "TOP_LIMIT": "15",
-        "LOG_FILE": "/var/log/xray-guard.log",
-        "PROC_REGEX": "xray|rw-core|sing-box|v2ray",
+        "description": "более жесткий режим для явной атаки, выше риск ложных банов.",
+        "values": {
+            "PORT": "443",
+            "CHECK_INTERVAL": "5",
+            "CPU_THRESHOLD": "220",
+            "GLOBAL_SYN": "250",
+            "GLOBAL_EST": "12000",
+            "PER_IP_SYN": "15",
+            "PER_IP_EST": "30",
+            "NFT_CONN_LIMIT": "20",
+            "NFT_RATE": "10/second",
+            "NFT_BURST": "16",
+            "BAN_TIMEOUT": "6h",
+        },
     },
 }
 
-PROMPTS = [
-    ("PORT", "Порт Xray/rw-core"),
-    ("INTERVAL", "Интервал проверки, сек"),
-    ("CPU_THRESHOLD", "Порог CPU процесса, %"),
-    ("GLOBAL_SYN_THRESHOLD", "Глобальный порог SYN-RECV"),
-    ("GLOBAL_EST_THRESHOLD", "Глобальный порог ESTABLISHED"),
-    ("PER_IP_SYN_BAN_THRESHOLD", "Банить IP при SYN-RECV >= "),
-    ("PER_IP_EST_BAN_THRESHOLD", "Банить IP при ESTABLISHED >= "),
-    ("NFT_CONN_LIMIT", "nftables: ct count over"),
-    ("NFT_RATE", "nftables: rate over"),
-    ("NFT_BURST", "nftables: burst packets"),
-    ("BAN_TIMEOUT", "Время бана"),
-    ("TOP_LIMIT", "Сколько top IP писать в лог"),
-    ("LOG_FILE", "Путь к лог-файлу"),
-    ("PROC_REGEX", "Regex процесса"),
-]
+FIELD_HELP = {
+    "PORT": "порт, который защищаем",
+    "CHECK_INTERVAL": "интервал проверки в секундах",
+    "CPU_THRESHOLD": "порог CPU процесса (%), после которого включается агрессивная логика",
+    "GLOBAL_SYN": "глобальный порог соединений в SYN_RECV",
+    "GLOBAL_EST": "глобальный порог ESTABLISHED",
+    "PER_IP_SYN": "бан по числу SYN_RECV на один IP",
+    "PER_IP_EST": "бан по числу ESTABLISHED на один IP",
+    "NFT_CONN_LIMIT": "nftables: лимит новых TCP-соединений на IP",
+    "NFT_RATE": "nftables: rate-limit новых TCP, например 18/second",
+    "NFT_BURST": "nftables: burst для rate-limit",
+    "BAN_TIMEOUT": "время бана, например 30m / 2h / 6h",
+}
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"[ERROR] {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg: str) -> None:
+    print(f"[i] {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"[OK] {msg}")
 
 
 def run(cmd, check=True, capture=False):
-    kwargs = {"text": True}
+    kwargs = {
+        "check": check,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
     if capture:
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
-    print("+", " ".join(cmd))
-    result = subprocess.run(cmd, **kwargs)
-    if check and result.returncode != 0:
-        stderr = result.stderr.strip() if capture and result.stderr else ""
-        raise RuntimeError(f"Команда упала: {' '.join(cmd)}\n{stderr}")
-    return result
+    return subprocess.run(cmd, **kwargs)
+
+
+def safe_input(prompt: str, default: str = "") -> str:
+    try:
+        value = input(prompt)
+    except EOFError:
+        print()
+        return default
+    value = value.strip()
+    if value == "":
+        return default
+    return value
+
+
+def ask_bool(prompt: str, default: bool = False) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    value = safe_input(f"{prompt} {suffix}: ", "")
+    if not value:
+        return default
+    return value.lower() in {"y", "yes", "д", "да"}
 
 
 def require_root():
     if os.geteuid() != 0:
-        print("Запусти под root:", file=sys.stderr)
-        print("  sudo python3 install_xray_guard.py", file=sys.stderr)
-        sys.exit(1)
+        die("запусти установщик от root, например: sudo python3 install_xray_guard.py")
 
 
-def check_systemctl():
-    if shutil.which("systemctl") is None:
-        raise RuntimeError("systemctl не найден. Этот установщик рассчитан на systemd.")
-    if shutil.which("nft") is None:
-        print("Внимание: nft не найден. Скрипт установится, но защита не заработает, пока не поставишь nftables.")
+def detect_dns_issue(hostname: str = "raw.githubusercontent.com") -> bool:
+    try:
+        socket.gethostbyname(hostname)
+        return False
+    except Exception:
+        return True
 
 
-def parse_env_file(path):
-    data = {}
-    if not os.path.exists(path):
-        return data
-
-    with open(path, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip()
-
-            if len(value) >= 2 and (
-                (value.startswith('"') and value.endswith('"')) or
-                (value.startswith("'") and value.endswith("'"))
-            ):
-                value = value[1:-1]
-
-            data[key] = value
-    return data
+def download_via_curl(url: str, dst: Path) -> bool:
+    if not shutil.which("curl"):
+        return False
+    try:
+        run(["curl", "-fL", "--connect-timeout", "15", "--retry", "3", "--retry-delay", "2", url, "-o", str(dst)])
+        return True
+    except subprocess.CalledProcessError:
+        return False
 
 
-def backup_file(path):
-    if not os.path.exists(path):
-        return
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backup_path = f"{path}.bak.{ts}"
-    shutil.copy2(path, backup_path)
-    print(f"[i] Backup: {path} -> {backup_path}")
+def download_via_wget(url: str, dst: Path) -> bool:
+    if not shutil.which("wget"):
+        return False
+    try:
+        run(["wget", "-O", str(dst), url])
+        return True
+    except subprocess.CalledProcessError:
+        return False
 
 
-def download_text(url):
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "xray-guard-installer/2.0"}
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        if resp.status != 200:
-            raise RuntimeError(f"Не удалось скачать {url}, HTTP {resp.status}")
-        data = resp.read()
+def download_via_urllib(url: str, dst: Path) -> bool:
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "xray-guard-installer/1.0",
+                "Accept": "*/*",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read()  # bytes, БЕЗ decode
+        dst.write_bytes(data)
+        return True
+    except Exception:
+        return False
+
+
+def validate_shell_file(path: Path) -> bool:
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return False
+    if not data:
+        return False
+    # Нормальная эвристика: ожидаем shebang/bash/nft/systemctl
     text = data.decode("utf-8", errors="replace")
-    if not text.strip():
-        raise RuntimeError("Скачанный файл пустой")
-    return text
+    signatures = ["#!/", "bash", "nft", "xray-guard", "systemctl"]
+    return any(sig in text for sig in signatures)
 
 
-def ensure_parent_dir(path):
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
+def download_shell_script(dst: Path) -> str:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(prefix="xray-guard.", suffix=".tmp", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    last_error = None
+    try:
+        for url in SHELL_URLS:
+            info(f"Пробую скачать shell-скрипт: {url}")
+
+            if download_via_curl(url, tmp_path) or download_via_wget(url, tmp_path) or download_via_urllib(url, tmp_path):
+                if validate_shell_file(tmp_path):
+                    dst.write_bytes(tmp_path.read_bytes())
+                    os.chmod(dst, 0o755)
+                    ok(f"Shell-скрипт скачан: {dst}")
+                    return url
+                last_error = "скачанный файл не похож на корректный shell-скрипт"
+            else:
+                last_error = f"не удалось скачать: {url}"
+
+        if detect_dns_issue():
+            die(
+                "не удалось скачать shell-скрипт. Похоже, на сервере проблема с DNS "
+                "(не резолвится raw.githubusercontent.com). Проверь /etc/resolv.conf."
+            )
+
+        die(last_error or "не удалось скачать shell-скрипт")
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
-def write_file(path, content, mode=None):
-    ensure_parent_dir(path)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(content)
-    if mode is not None:
-        os.chmod(path, mode)
-
-
-def env_quote(value):
-    value = str(value).replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{value}"'
-
-
-def ask(question, default, validator=None, non_interactive=False):
-    if non_interactive:
-        return str(default)
-
-    while True:
-        raw = input(f"{question} [{default}]: ").strip()
-        value = raw if raw else str(default)
-
-        if validator is None:
-            return value
-
-        ok, err = validator(value)
-        if ok:
-            return value
-        print(f"  ! {err}")
-
-
-def ask_yes_no(question, default=False, non_interactive=False):
-    if non_interactive:
-        return default
-
-    suffix = "Y/n" if default else "y/N"
-    raw = input(f"{question} [{suffix}]: ").strip().lower()
-
-    if not raw:
-        return default
-    return raw in ("y", "yes", "д", "да")
-
-
-def choose_preset(non_interactive=False, cli_preset=None):
-    valid = ["very-light", "optimal", "strong", "custom"]
-
-    if cli_preset:
-        cli_preset = cli_preset.strip().lower()
-        if cli_preset not in valid:
-            raise RuntimeError(f"Неверный preset: {cli_preset}. Разрешены: {', '.join(valid)}")
-        return cli_preset
-
-    if non_interactive:
-        return "optimal"
-
+def choose_preset() -> dict:
+    print()
     print("Выбери пресет защиты:")
     print("  1) very-light  - очень легкая, минимум ложных банов")
     print("  2) optimal     - оптимальная, рекомендую начать с нее")
     print("  3) strong      - сильная, если идет явная атака")
     print("  4) custom      - ручная настройка")
-    print("")
+    print()
+
+    raw = safe_input("Твой выбор [2]: ", "2").lower()
 
     mapping = {
         "1": "very-light",
@@ -237,308 +256,192 @@ def choose_preset(non_interactive=False, cli_preset=None):
         "custom": "custom",
     }
 
-    while True:
-        raw = input("Твой выбор [2]: ").strip().lower()
-        if not raw:
-            return "optimal"
-        if raw in mapping:
-            return mapping[raw]
-        print("  ! Введи 1, 2, 3, 4 или имя пресета")
+    if raw not in mapping:
+        raw = "2"
+
+    selected = mapping[raw]
+
+    if selected == "custom":
+        base = PRESETS["optimal"]["values"].copy()
+        print()
+        print("Выбран режим: custom")
+        print("За основу взят preset: optimal")
+        return base
+
+    print()
+    print(f"Выбран пресет: {selected}")
+    print(f"Описание: {PRESETS[selected]['description']}")
+    return PRESETS[selected]["values"].copy()
 
 
-def validate_port(v):
-    if not v.isdigit():
-        return False, "Нужен integer"
-    n = int(v)
-    if 1 <= n <= 65535:
-        return True, ""
-    return False, "Порт должен быть 1..65535"
+def edit_config(config: dict) -> dict:
+    print()
+    print("Заполни параметры. Enter = оставить текущее значение.")
+    print()
 
-
-def validate_positive_int(v):
-    if not v.isdigit():
-        return False, "Нужен integer >= 1"
-    if int(v) < 1:
-        return False, "Должно быть >= 1"
-    return True, ""
-
-
-def validate_nonempty(v):
-    if str(v).strip():
-        return True, ""
-    return False, "Пустое значение нельзя"
-
-
-def build_cli_overrides(args):
-    return {
-        "PORT": args.port,
-        "INTERVAL": args.interval,
-        "CPU_THRESHOLD": args.cpu_threshold,
-        "GLOBAL_SYN_THRESHOLD": args.global_syn_threshold,
-        "GLOBAL_EST_THRESHOLD": args.global_est_threshold,
-        "PER_IP_SYN_BAN_THRESHOLD": args.per_ip_syn_ban_threshold,
-        "PER_IP_EST_BAN_THRESHOLD": args.per_ip_est_ban_threshold,
-        "NFT_CONN_LIMIT": args.nft_conn_limit,
-        "NFT_RATE": args.nft_rate,
-        "NFT_BURST": args.nft_burst,
-        "BAN_TIMEOUT": args.ban_timeout,
-        "TOP_LIMIT": args.top_limit,
-        "LOG_FILE": args.log_file,
-        "PROC_REGEX": args.proc_regex,
-    }
-
-
-def collect_config(existing, args):
-    preset = choose_preset(non_interactive=args.non_interactive, cli_preset=args.preset)
-
-    if preset == "custom":
-        base = dict(existing) if existing else dict(PRESETS["optimal"])
-    else:
-        base = dict(PRESETS[preset])
-
-    validators = {
-        "PORT": validate_port,
-        "INTERVAL": validate_positive_int,
-        "CPU_THRESHOLD": validate_positive_int,
-        "GLOBAL_SYN_THRESHOLD": validate_positive_int,
-        "GLOBAL_EST_THRESHOLD": validate_positive_int,
-        "PER_IP_SYN_BAN_THRESHOLD": validate_positive_int,
-        "PER_IP_EST_BAN_THRESHOLD": validate_positive_int,
-        "NFT_CONN_LIMIT": validate_positive_int,
-        "NFT_BURST": validate_positive_int,
-        "TOP_LIMIT": validate_positive_int,
-        "NFT_RATE": validate_nonempty,
-        "BAN_TIMEOUT": validate_nonempty,
-        "LOG_FILE": validate_nonempty,
-        "PROC_REGEX": validate_nonempty,
-    }
-
-    cli_overrides = build_cli_overrides(args)
-
-    if preset != "custom":
-        for key, value in existing.items():
-            if key in base and args.keep_existing:
-                base[key] = value
-
-    for key, value in cli_overrides.items():
-        if value is not None:
-            base[key] = value
-
-    values = {}
-    values["PRESET_NAME"] = preset
-
-    if args.non_interactive:
-        for key, _ in PROMPTS:
-            values[key] = str(base.get(key, ""))
-        return values
-
-    print("")
-    print(f"Выбран пресет: {preset}")
-    if preset == "very-light":
-        print("Описание: максимально бережный режим, чтобы почти не резать легит трафик.")
-    elif preset == "optimal":
-        print("Описание: нормальный баланс между защитой и ложными срабатываниями.")
-    elif preset == "strong":
-        print("Описание: агрессивнее, для периода атаки.")
-    else:
-        print("Описание: ручная настройка.")
-    print("")
-
-    manual_tune = True if preset == "custom" else ask_yes_no(
-        "Хочешь вручную отредактировать параметры после выбора пресета?",
-        default=False,
-        non_interactive=args.non_interactive
-    )
-
-    if manual_tune:
-        for key, label in PROMPTS:
-            values[key] = ask(
-                label,
-                base.get(key, ""),
-                validator=validators.get(key),
-                non_interactive=args.non_interactive
-            )
-    else:
-        for key, _ in PROMPTS:
-            values[key] = str(base.get(key, ""))
-
-    return values
-
-
-def build_env_content(values, script_path):
-    lines = [
-        "# /etc/default/xray-guard",
-        "# Сгенерировано установщиком xray-guard",
-        f"# Script: {script_path}",
-        f"# Preset: {values.get('PRESET_NAME', 'unknown')}",
-        "",
-    ]
-    for key, _ in PROMPTS:
-        lines.append(f"{key}={env_quote(values[key])}")
-    lines.append("")
-    return "\n".join(lines)
-
-
-def build_service_content(script_path, env_path):
-    return textwrap.dedent(f"""\
-        [Unit]
-        Description=Xray Guard auto-ban service
-        After=network-online.target
-        Wants=network-online.target
-
-        [Service]
-        Type=simple
-        EnvironmentFile=-{env_path}
-        ExecStart={script_path}
-        Restart=always
-        RestartSec=2
-        KillMode=process
-
-        [Install]
-        WantedBy=multi-user.target
-    """)
-
-
-def install_script(script_url, script_path):
-    print(f"[i] Скачиваю shell-скрипт: {script_url}")
-    content = download_text(script_url)
-
-    required_markers = [
-        "PORT=",
-        "PROC_REGEX=",
+    ordered_keys = [
+        "PORT",
+        "CHECK_INTERVAL",
+        "CPU_THRESHOLD",
+        "GLOBAL_SYN",
+        "GLOBAL_EST",
+        "PER_IP_SYN",
+        "PER_IP_EST",
+        "NFT_CONN_LIMIT",
+        "NFT_RATE",
+        "NFT_BURST",
         "BAN_TIMEOUT",
     ]
-    missing = [m for m in required_markers if m not in content]
-    if missing:
-        raise RuntimeError(
-            "Скачанный xray-guard.sh не похож на ожидаемый файл. "
-            f"Не найдены маркеры: {', '.join(missing)}"
-        )
 
-    backup_file(script_path)
-    write_file(script_path, content, mode=0o755)
+    for key in ordered_keys:
+        current = str(config[key])
+        desc = FIELD_HELP.get(key, "")
+        value = safe_input(f"{key} ({desc}) [{current}]: ", current)
+        config[key] = value
 
-    st = os.stat(script_path)
-    os.chmod(script_path, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    print(f"[ok] Установлен {script_path}")
+    return config
 
 
-def install_env(env_path, env_content):
-    backup_file(env_path)
-    write_file(env_path, env_content, mode=0o644)
-    print(f"[ok] Записан env-файл {env_path}")
+def write_env_file(config: dict, path: Path):
+    lines = [
+        "# xray-guard configuration",
+        "# generated by install_xray_guard.py",
+        "",
+    ]
+
+    ordered_keys = [
+        "PORT",
+        "CHECK_INTERVAL",
+        "CPU_THRESHOLD",
+        "GLOBAL_SYN",
+        "GLOBAL_EST",
+        "PER_IP_SYN",
+        "PER_IP_EST",
+        "NFT_CONN_LIMIT",
+        "NFT_RATE",
+        "NFT_BURST",
+        "BAN_TIMEOUT",
+    ]
+
+    for key in ordered_keys:
+        val = str(config[key])
+        lines.append(f"{key}={shlex.quote(val)}")
+
+    lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    ok(f"Env-файл записан: {path}")
 
 
-def install_service(service_path, service_content):
-    backup_file(service_path)
-    write_file(service_path, service_content, mode=0o644)
-    print(f"[ok] Записан systemd unit {service_path}")
+def build_service_text() -> str:
+    return f"""[Unit]
+Description=Xray Guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-{ENV_PATH}
+ExecStart={SHELL_PATH}
+Restart=always
+RestartSec=3
+User=root
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+"""
 
 
-def enable_and_start_service():
-    run(["systemctl", "daemon-reload"])
-    run(["systemctl", "enable", SERVICE_NAME])
-    run(["systemctl", "restart", SERVICE_NAME])
-
-    active = run(["systemctl", "is-active", SERVICE_NAME], check=False, capture=True)
-    status = active.stdout.strip() if active.stdout else "unknown"
-
-    if status != "active":
-        print("[!] Сервис не стал active. Показываю статус:")
-        run(["systemctl", "status", SERVICE_NAME, "--no-pager", "-l"], check=False)
-        raise RuntimeError("Сервис не запустился нормально")
-
-    print(f"[ok] Сервис {SERVICE_NAME} активен")
+def write_service_file(path: Path):
+    path.write_text(build_service_text(), encoding="utf-8")
+    ok(f"Systemd unit записан: {path}")
 
 
-def print_summary(values, script_path, env_path, service_path):
-    print("\n====== ГОТОВО ======")
-    print(f"Preset       : {values.get('PRESET_NAME', 'unknown')}")
-    print(f"Shell script : {script_path}")
-    print(f"Env file     : {env_path}")
-    print(f"Service      : {service_path}")
-    print("")
-    print("Текущие настройки:")
-    for key, _ in PROMPTS:
-        print(f"  {key}={values[key]}")
-    print("")
+def systemctl(*args):
+    return run(["systemctl", *args])
+
+
+def install():
+    require_root()
+
+    info("Установщик xray-guard")
+    info(f"Shell URL: {SHELL_URLS[0]}")
+    info(f"Shell path: {SHELL_PATH}")
+    info(f"Env path: {ENV_PATH}")
+    info(f"Service path: {SERVICE_PATH}")
+
+    config = choose_preset()
+
+    if ask_bool("Хочешь вручную отредактировать параметры после выбора пресета?", False):
+        config = edit_config(config)
+
+    print()
+    used_url = download_shell_script(SHELL_PATH)
+    info(f"Использован источник: {used_url}")
+
+    ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    write_env_file(config, ENV_PATH)
+    write_service_file(SERVICE_PATH)
+
+    info("Перезагружаю systemd...")
+    systemctl("daemon-reload")
+
+    info("Включаю автозапуск сервиса...")
+    systemctl("enable", SERVICE_NAME)
+
+    info("Перезапускаю сервис...")
+    systemctl("restart", SERVICE_NAME)
+
+    try:
+        active = run(["systemctl", "is-active", SERVICE_NAME], capture=True).stdout.strip()
+    except Exception:
+        active = "unknown"
+
+    try:
+        enabled = run(["systemctl", "is-enabled", SERVICE_NAME], capture=True).stdout.strip()
+    except Exception:
+        enabled = "unknown"
+
+    print()
+    ok(f"Установка завершена. Service active={active}, enabled={enabled}")
+    print()
     print("Полезные команды:")
-    print(f"  systemctl status {SERVICE_NAME} --no-pager -l")
-    print(f"  journalctl -u {SERVICE_NAME} -f")
-    print(f"  tail -f {values['LOG_FILE']}")
-    print(f"  systemctl restart {SERVICE_NAME}")
-    print(f"  systemctl stop {SERVICE_NAME}")
-    print(f"  systemctl disable --now {SERVICE_NAME}")
-    print("")
+    print(f"  systemctl status {SERVICE_NAME} --no-pager")
+    print("  journalctl -u xray-guard.service -n 100 --no-pager")
+    print("  tail -f /var/log/xray-guard.log")
+    print(f"  cat {ENV_PATH}")
+    print()
 
+    if ask_bool("Показать текущий статус сервиса прямо сейчас?", True):
+        print()
+        try:
+            run(["systemctl", "status", SERVICE_NAME, "--no-pager"])
+        except subprocess.CalledProcessError:
+            print("[WARN] systemctl status вернул ненулевой код, смотри журнал выше.")
 
-def build_arg_parser():
-    p = argparse.ArgumentParser(
-        description="Установщик xray-guard.sh + systemd service + presets"
-    )
-
-    p.add_argument("--script-url", default=DEFAULT_SCRIPT_URL, help="RAW URL shell-скрипта")
-    p.add_argument("--script-path", default=DEFAULT_SCRIPT_PATH, help="Куда ставить xray-guard.sh")
-    p.add_argument("--env-path", default=DEFAULT_ENV_PATH, help="Путь env-файла")
-    p.add_argument("--service-path", default=DEFAULT_SERVICE_PATH, help="Путь systemd unit")
-    p.add_argument("--non-interactive", action="store_true", help="Не спрашивать значения, взять preset/CLI/defaults")
-    p.add_argument("--preset", choices=["very-light", "optimal", "strong", "custom"], help="Пресет настроек")
-    p.add_argument("--keep-existing", action="store_true", help="Если есть старый env-файл, использовать его значения поверх пресета")
-
-    p.add_argument("--port")
-    p.add_argument("--interval")
-    p.add_argument("--cpu-threshold")
-    p.add_argument("--global-syn-threshold")
-    p.add_argument("--global-est-threshold")
-    p.add_argument("--per-ip-syn-ban-threshold")
-    p.add_argument("--per-ip-est-ban-threshold")
-    p.add_argument("--nft-conn-limit")
-    p.add_argument("--nft-rate")
-    p.add_argument("--nft-burst")
-    p.add_argument("--ban-timeout")
-    p.add_argument("--top-limit")
-    p.add_argument("--log-file")
-    p.add_argument("--proc-regex")
-
-    return p
+    if ask_bool("Показать последние 30 строк лога xray-guard?", True):
+        print()
+        try:
+            run(["journalctl", "-u", "xray-guard.service", "-n", "30", "--no-pager"])
+        except subprocess.CalledProcessError:
+            print("[WARN] Не удалось показать journalctl.")
+        if Path("/var/log/xray-guard.log").exists():
+            print()
+            try:
+                run(["tail", "-n", "30", "/var/log/xray-guard.log"])
+            except subprocess.CalledProcessError:
+                print("[WARN] Не удалось показать /var/log/xray-guard.log.")
 
 
 def main():
-    parser = build_arg_parser()
-    args = parser.parse_args()
-
-    require_root()
-    check_systemctl()
-
-    existing = parse_env_file(args.env_path)
-
-    print("[i] Установщик xray-guard")
-    print(f"[i] Shell URL: {args.script_url}")
-    print(f"[i] Shell path: {args.script_path}")
-    print(f"[i] Env path: {args.env_path}")
-    print(f"[i] Service path: {args.service_path}")
-    print("")
-
-    values = collect_config(existing, args)
-
-    install_script(args.script_url, args.script_path)
-
-    env_content = build_env_content(values, args.script_path)
-    install_env(args.env_path, env_content)
-
-    service_content = build_service_content(args.script_path, args.env_path)
-    install_service(args.service_path, service_content)
-
-    enable_and_start_service()
-    print_summary(values, args.script_path, args.env_path, args.service_path)
+    try:
+        install()
+    except KeyboardInterrupt:
+        print("\n[ERROR] Прервано пользователем")
+        sys.exit(130)
+    except Exception as e:
+        die(str(e))
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\nОстановлено пользователем", file=sys.stderr)
-        sys.exit(130)
-    except Exception as e:
-        print(f"\n[ERROR] {e}", file=sys.stderr)
-        sys.exit(1)
+    main()
